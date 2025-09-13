@@ -1,6 +1,6 @@
 -- /follower.lua
-local Messages = require("messages")
-local Utils    = require("utils")
+local Messages = require("shared/messages")
+local Utils    = require("shared/utils")
 
 _G.TURTLE_ROLE = "follower"
 local OP = Messages.OP

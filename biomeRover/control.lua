@@ -8,7 +8,7 @@
 -- =============== CONFIG ===============
 
 local PROTOCOL      = "turtle_rover"
-local SAVE_PATH     = "/rover/config.json"
+local SAVE_PATH     = "/biomeRover/config.json"
 local HEARTBEAT_SEC = 1.0          -- UI refresh cadence
 local HELLO_TIMEOUT = 3.0          -- wait after scan
 local REPLY_TIMEOUT = 2.5          -- network reply timeout
