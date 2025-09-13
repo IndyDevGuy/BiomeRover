@@ -1,0 +1,161 @@
+name: Build manifest & deploy to Pages
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    name: Detect version change
+    runs-on: ubuntu-latest
+    outputs:
+      version_changed: ${{ steps.diff.outputs.changed }}
+      version_new:     ${{ steps.diff.outputs.new }}
+      version_old:     ${{ steps.diff.outputs.old }}
+    steps:
+      - name: Checkout (full history for diff)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version before/after
+        id: diff
+        shell: bash
+        env:
+          VER_PATH: biomeRover/app_version.txt
+          BEFORE:   ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          # new version (head)
+          NEW="0.0.0"
+          if [[ -f "$VER_PATH" ]]; then
+            NEW=$(tr -d '\r\n' < "$VER_PATH" || true)
+            [[ -z "$NEW" ]] && NEW="0.0.0"
+          fi
+
+          # old version (previous commit on this branch)
+          OLD="missing"
+          if [[ -n "${BEFORE:-}" && "$BEFORE" != "0000000000000000000000000000000000000000" ]]; then
+            if git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+              OLD_CONTENT=$(git show "$BEFORE:$VER_PATH" 2>/dev/null || true)
+              if [[ -n "$OLD_CONTENT" ]]; then
+                OLD=$(echo "$OLD_CONTENT" | tr -d '\r\n')
+              fi
+            fi
+          fi
+
+          CHANGED="false"
+          if [[ "$OLD" != "$NEW" ]]; then CHANGED="true"; fi
+
+          echo "old=$OLD"       >> "$GITHUB_OUTPUT"
+          echo "new=$NEW"       >> "$GITHUB_OUTPUT"
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+
+          echo "Old version: $OLD"
+          echo "New version: $NEW"
+          echo "Changed? $CHANGED"
+
+  build:
+    name: Build site
+    needs: detect
+    if: needs.detect.outputs.version_changed == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate manifest.json, app.json, and installer.json
+        run: |
+          python3 - <<'PY'
+          import os, json, pathlib, time
+          owner, repo = os.environ['GITHUB_REPOSITORY'].split('/', 1)
+          sha  = os.environ['GITHUB_SHA']
+          root = pathlib.Path('biomeRover')
+
+          urls = []
+          if root.exists():
+            for p in sorted(root.rglob('*')):
+              if p.is_file():
+                urls.append(f'https://raw.githubusercontent.com/{owner}/{repo}/{sha}/{p.as_posix()}')
+
+          out = pathlib.Path('public'); out.mkdir(exist_ok=True)
+          (out/'manifest.json').write_text(json.dumps(urls, indent=2))
+
+          # app.json (version + stable manifest URL + commit)
+          version = '0.0.0'
+          pv = pathlib.Path('biomeRover/app_version.txt')
+          if pv.exists(): version = pv.read_text().strip() or '0.0.0'
+          app = {
+            "version": version,
+            "manifest_url": f"https://{owner}.github.io/{repo}/manifest.json",
+            "commit": sha,
+            "built_at": int(time.time())
+          }
+          (out/'app.json').write_text(json.dumps(app, indent=2))
+
+          # installer.json (for self-updating installer.lua)
+          version = '0.0.0'
+          pv = pathlib.Path('installer_version.txt')
+          if pv.exists(): version = pv.read_text().strip() or '0.0.0'
+          inst_url = f'https://raw.githubusercontent.com/{owner}/{repo}/{sha}/install.lua'
+          (out/'installer.json').write_text(json.dumps({"version": version, "url": inst_url}, indent=2))
+
+          print(f"Wrote manifest.json ({len(urls)} files), app.json (v{version}), installer.json")
+          PY
+
+      # Prevent Jekyll from hiding anything
+      - name: Add .nojekyll
+        run: |
+          mkdir -p public
+          touch public/.nojekyll
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    name: Deploy to pages
+    needs: build
+    if: needs.detect.outputs.version_changed == 'true' || github.event_name == 'workflow_dispatch'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+  verify:
+    name: Verify site is live
+    needs: deploy
+    if: needs.detect.outputs.version_changed == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for CDN & verify manifest is live
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO:  ${{ github.event.repository.name }}
+        run: |
+          URL="https://${OWNER}.github.io/${REPO}/manifest.json"
+          echo "Probing $URL"
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
+            if [ "$code" = "200" ]; then
+              echo "OK: $URL is live"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Timed out waiting for $URL" >&2
+          exit 1
